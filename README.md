@@ -1,5 +1,7 @@
 # openclaw-memory-engram
 
+![openclaw-memory-engram](assets/banner.png)
+
 OpenClaw plugin for [Engram](https://github.com/Gentleman-Programming/engram) — persistent
 structured memory for AI agents with SQLite + FTS5 full-text search.
 
