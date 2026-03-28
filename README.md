@@ -164,12 +164,12 @@ cloned the plugin — this is how OpenClaw discovers and loads it:
 ```jsonc
 {
   "plugins": {
-    "allow": ["memory-engram"],
+    "allow": ["openclaw-memory-engram"],
     "load": {
       "paths": ["/path/to/openclaw-memory-engram"]
     },
     "entries": {
-      "memory-engram": {
+      "openclaw-memory-engram": {
         "enabled": true,
         "config": {
           "url": "http://127.0.0.1:7437",
@@ -196,7 +196,7 @@ openclaw gateway restart
 ### Tool visibility
 
 If your agents use `tools.profile: "coding"` or `tools.profile: "messaging"`, plugin tools may not
-be visible. Set `tools.profile: "full"` globally or add `"memory-engram"` to `tools.allow`:
+be visible. Set `tools.profile: "full"` globally or add `"openclaw-memory-engram"` to `tools.allow`:
 
 ```jsonc
 {

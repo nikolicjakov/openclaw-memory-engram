@@ -1,5 +1,5 @@
 {
-  "name": "memory-engram",
+  "name": "openclaw-memory-engram",
   "version": "0.7.0",
   "type": "module",
   "description": "OpenClaw memory plugin for Engram (github.com/Gentleman-Programming/engram) — SQLite + FTS5 persistent memory for AI agents",

@@ -106,8 +106,8 @@ function formatObservationCompact(obs: Observation, index: number): string {
 // ============================================================================
 
 export default {
-  id: "memory-engram",
-  name: "Engram Memory",
+  id: "openclaw-memory-engram",
+  name: "OpenClaw Engram Memory",
   description: "Persistent agent memory via Engram (github.com/Gentleman-Programming/engram) — SQLite + FTS5 full-text search with topic-based deduplication",
 
   register(api: any) {
@@ -763,7 +763,7 @@ export default {
     // Service registration (lifecycle)
     // =========================================================================
     api.registerService({
-      id: "memory-engram",
+      id: "openclaw-memory-engram",
       start: () => {
         client.checkHealth().then((h) => {
           if (h.ok) {
