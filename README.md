@@ -1,4 +1,4 @@
-# memory-engram
+# openclaw-memory-engram
 
 OpenClaw plugin for [Engram](https://github.com/Gentleman-Programming/engram) — persistent
 structured memory for AI agents with SQLite + FTS5 full-text search.
@@ -152,7 +152,7 @@ WantedBy=default.target
 Clone the plugin to a local directory:
 
 ```bash
-git clone https://github.com/nikolicjakov/memory-engram.git
+git clone https://github.com/nikolicjakov/openclaw-memory-engram.git
 cd openclaw-memory-engram && npm install
 ```
 
