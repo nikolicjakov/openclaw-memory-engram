@@ -206,6 +206,27 @@ be visible. Set `tools.profile: "full"` globally or add `"openclaw-memory-engram
 }
 ```
 
+### Replacing memory-core entirely
+
+If you want agents to use Engram as their **only** memory system and stop using the built-in
+Markdown-based `memory-core` tools, you can deny them globally in your `openclaw.json`:
+
+```jsonc
+{
+  "tools": {
+    "profile": "full",
+    "deny": ["memory_search", "memory_get"]
+  }
+}
+```
+
+This blocks the core `memory_search` and `memory_get` tools for all agents while keeping
+the `engram_*` tools available. Agents will no longer attempt to search Markdown files for
+memory and will rely exclusively on Engram.
+
+This is optional. By default the plugin coexists with `memory-core` and both systems work
+in parallel.
+
 ## Coexistence with memory-core
 
 This plugin runs **alongside** `memory-core`, not as a replacement. Do NOT set
