@@ -1,0 +1,41 @@
+{
+  "name": "memory-engram",
+  "version": "0.7.0",
+  "type": "module",
+  "description": "OpenClaw memory plugin for Engram (github.com/Gentleman-Programming/engram) — SQLite + FTS5 persistent memory for AI agents",
+  "main": "index.ts",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nikolicjakov/memory-engram.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.13"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "memory",
+    "engram",
+    "sqlite",
+    "fts5",
+    "persistent-memory",
+    "ai-agents"
+  ],
+  "author": "Jakov Nikolić <nikolicjakov@gmail.com>",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.3"
+  }
+}

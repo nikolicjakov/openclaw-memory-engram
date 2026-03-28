@@ -1,0 +1,52 @@
+{
+  "id": "memory-engram",
+  "name": "Engram Memory",
+  "description": "Persistent agent memory via Engram (github.com/Gentleman-Programming/engram) — SQLite + FTS5 full-text search with session lifecycle, topic-based deduplication, auto-recall, and progressive disclosure",
+  "version": "0.7.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "url": {
+        "type": "string",
+        "default": "http://127.0.0.1:7437",
+        "description": "Engram HTTP API base URL"
+      },
+      "project": {
+        "type": "string",
+        "default": "general",
+        "description": "Default Engram project for memory storage"
+      },
+      "maxResults": {
+        "type": "number",
+        "default": 10,
+        "description": "Maximum search results to return"
+      },
+      "timeoutMs": {
+        "type": "number",
+        "default": 5000,
+        "description": "HTTP request timeout in milliseconds"
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "default": true,
+        "description": "Automatically inject relevant memories before agent execution"
+      },
+      "autoCapture": {
+        "type": "boolean",
+        "default": false,
+        "description": "Automatically capture agent outputs as memories (experimental)"
+      },
+      "recallLimit": {
+        "type": "number",
+        "default": 5,
+        "description": "Maximum memories to inject during auto-recall"
+      },
+      "recallMinScore": {
+        "type": "number",
+        "default": 0.3,
+        "description": "Minimum normalized relevance score for auto-recall (0.0-1.0)"
+      }
+    }
+  }
+}
