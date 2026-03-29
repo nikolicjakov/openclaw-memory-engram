@@ -4,7 +4,6 @@ export interface EngramConfig {
   maxResults: number;
   timeoutMs: number;
   autoRecall: boolean;
-  autoCapture: boolean;
   recallLimit: number;
   recallMinScore: number;
 }
@@ -53,7 +52,6 @@ export function parseConfig(value: unknown): EngramConfig {
     maxResults: (v.maxResults as number) || 10,
     timeoutMs: (v.timeoutMs as number) || 5000,
     autoRecall: v.autoRecall !== false,
-    autoCapture: (v.autoCapture as boolean) || false,
     recallLimit: (v.recallLimit as number) || 5,
     recallMinScore: (v.recallMinScore as number) || 0.3,
   };

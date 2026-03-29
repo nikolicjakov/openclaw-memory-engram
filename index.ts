@@ -5,7 +5,8 @@ import natural from "natural";
 
 const VALID_TYPES = [
   "decision", "bugfix", "discovery", "config", "pattern",
-  "preference", "session_summary", "warning", "procedure", "general",
+  "preference", "warning", "procedure", "general",
+  "architecture", "reference", "troubleshooting",
 ];
 
 // ============================================================================
@@ -49,6 +50,7 @@ const SKIP_PROMPT_PATTERNS = [
   /^agent-to-agent\b/i,
   /^\s*\[announce\]\s/i,
   /^read\s+\S+\.md\s+(if\s+)?(it\s+)?exists/i,
+  /^\s*\/(?:new|reset|clear|start|help|status|ping|version)\b/i,
 ];
 
 const STOP_WORDS = new Set([
@@ -408,64 +410,6 @@ export default {
       { name: "engram_context" },
     );
 
-    // =========================================================================
-    // TOOL 7: engram_session_start — register a session
-    // =========================================================================
-    api.registerTool(
-      {
-        name: "engram_session_start",
-        label: "Start Engram Session",
-        description:
-          "Register a new session with Engram. Call at the beginning of every work session. " +
-          "Session ID format: '<agent>-YYYY-MM-DD-NNN' (e.g., 'orchestrator-2026-03-22-001').",
-        parameters: Type.Object({
-          session_id: Type.String({ description: "Session identifier (e.g., 'orchestrator-2026-03-22-001')" }),
-          project: Type.Optional(Type.String({ description: "Project name (default: configured project)" })),
-          directory: Type.Optional(Type.String({ description: "Working directory path (helps correlate sessions to repos)" })),
-        }),
-        async execute(_id: string, params: { session_id: string; project?: string; directory?: string }) {
-          const ok = await client.startSession(params.session_id, params.project || config.project, params.directory);
-          return {
-            content: [{
-              type: "text" as const,
-              text: ok
-                ? `Session "${params.session_id}" started (project: ${params.project || config.project})`
-                : `Failed to start session "${params.session_id}" — Engram may be unreachable`,
-            }],
-          };
-        },
-      },
-      { name: "engram_session_start" },
-    );
-
-    // =========================================================================
-    // TOOL 8: engram_session_end — end a session with summary
-    // =========================================================================
-    api.registerTool(
-      {
-        name: "engram_session_end",
-        label: "End Engram Session",
-        description:
-          "End an Engram session with a summary. MANDATORY at session end and before compaction. " +
-          "Summary format: 'Goal: X. Discoveries: Y. Accomplished: Z. Next: W. Files: A, B'",
-        parameters: Type.Object({
-          session_id: Type.String({ description: "Session ID to end" }),
-          summary: Type.String({ description: "End-of-session summary. Format: 'Goal: X. Discoveries: Y. Accomplished: Z. Next: W. Files: A, B'" }),
-        }),
-        async execute(_id: string, params: { session_id: string; summary: string }) {
-          const ok = await client.endSession(params.session_id, params.summary);
-          return {
-            content: [{
-              type: "text" as const,
-              text: ok
-                ? `Session "${params.session_id}" ended with summary`
-                : `Failed to end session "${params.session_id}"`,
-            }],
-          };
-        },
-      },
-      { name: "engram_session_end" },
-    );
 
     // =========================================================================
     // TOOL 9: engram_timeline — chronological context around an observation
@@ -684,47 +628,6 @@ export default {
     }
 
     // =========================================================================
-    // Hook: agent_end — auto-capture (experimental)
-    // =========================================================================
-    if (config.autoCapture) {
-      api.on("agent_end", async (event: { messages?: unknown[]; success?: boolean }, ctx: { agentId?: string; sessionId?: string }) => {
-        if (!event.success || !event.messages || event.messages.length === 0) return;
-
-        try {
-          const texts: string[] = [];
-          for (const msg of event.messages) {
-            if (!msg || typeof msg !== "object") continue;
-            const m = msg as Record<string, unknown>;
-            if (m.role !== "user") continue;
-            const content = m.content;
-            if (typeof content === "string" && content.length >= 10 && content.length <= 5000) {
-              if (!content.includes("<engram-memory>") && !looksLikeInjection(content)) {
-                texts.push(content);
-              }
-            }
-          }
-
-          let stored = 0;
-          for (const text of texts.slice(0, 3)) {
-            await client.save({
-              session_id: ctx.sessionId || `auto-${Date.now()}`,
-              title: `Auto-captured from ${ctx.agentId || "unknown"} session`,
-              content: text.slice(0, 2000),
-              type: "session_summary",
-              project: config.project,
-            });
-            stored++;
-          }
-          if (stored > 0) {
-            log.info(`memory-engram: auto-captured ${stored} memories`);
-          }
-        } catch (err) {
-          log.warn(`memory-engram: capture failed: ${String(err)}`);
-        }
-      });
-    }
-
-    // =========================================================================
     // Hook: before_compaction — log compaction events
     // =========================================================================
     api.on("before_compaction", async (event: { messageCount?: number; tokenCount?: number }, ctx: { agentId?: string }) => {
@@ -901,7 +804,7 @@ export default {
       start: () => {
         client.checkHealth().then((h) => {
           if (h.ok) {
-            log.info(`memory-engram: connected to Engram v${h.version} at ${config.url} (autoRecall=${config.autoRecall} default-allow, autoCapture=${config.autoCapture})`);
+            log.info(`memory-engram: connected to Engram v${h.version} at ${config.url} (autoRecall=${config.autoRecall} default-allow)`);
           } else {
             log.warn(`memory-engram: could not reach Engram at ${config.url} — tools will gracefully degrade`);
           }

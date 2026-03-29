@@ -53,7 +53,7 @@ and Markdown files for curated long-term notes.
 
 ## Features
 
-- **11 agent tools** (`engram_*` namespace) — full memory lifecycle from search to session management
+- **9 agent tools** (`engram_*` namespace) — full memory lifecycle from search to session management
 - **Automatic memory recall (RAG)** — searches Engram on every incoming message and injects relevant memories into agent context before the LLM sees the prompt
 - **Smart query extraction** — strips channel metadata (Mattermost/Telegram/Discord framing, timestamps) and stop words from prompts to produce clean FTS5 search keywords
 - **Progressive FTS5 fallback** — when the full keyword query returns no results, progressively drops terms until a match is found
@@ -181,7 +181,6 @@ cloned the plugin — this is how OpenClaw discovers and loads it:
           "maxResults": 10,
           "timeoutMs": 5000,
           "autoRecall": true,
-          "autoCapture": false,
           "recallLimit": 5,
           "recallMinScore": 0.3
         }
@@ -239,7 +238,7 @@ This plugin runs **alongside** `memory-core`, not as a replacement. Do NOT set
 | System | Searches | Tool names | Purpose |
 |--------|----------|------------|---------|
 | `memory-core` | Markdown files (`MEMORY.md`, `memory/*.md`) | `memory_search`, `memory_get` | Daily logs, curated long-term notes |
-| `memory-engram` | Engram database (SQLite + FTS5) | `engram_*` (11 tools) | Structured observations, decisions, session history |
+| `memory-engram` | Engram database (SQLite + FTS5) | `engram_*` (9 tools) | Structured observations, decisions, session history |
 
 ## Agent Tools
 
@@ -259,8 +258,6 @@ All tools use the `engram_*` namespace to avoid conflicts with core tools.
 
 | Tool | Description |
 |------|-------------|
-| `engram_session_start` | Register a new session. Session ID format: `<agent>-YYYY-MM-DD-NNN`. |
-| `engram_session_end` | End session with summary. Summary format: `Goal: X. Discoveries: Y. Accomplished: Z. Next: W.` |
 | `engram_context` | Load project context (recent sessions, observations, prompts) for session bootstrap. |
 
 ### Progressive Disclosure
@@ -275,7 +272,7 @@ All tools use the `engram_*` namespace to avoid conflicts with core tools.
 
 Tools accept a `type` parameter with these values:
 
-`decision` `bugfix` `discovery` `config` `pattern` `preference` `session_summary` `warning` `procedure` `general`
+`decision` `bugfix` `discovery` `config` `pattern` `preference` `warning` `procedure` `general`
 
 ## Hooks
 
@@ -286,7 +283,6 @@ The plugin registers the following lifecycle hooks:
 | `before_prompt_build` | Before each agent turn | Auto-recall: searches Engram with extracted keywords, injects relevant memories as `prependContext` |
 | `before_agent_start` | Before each agent turn (legacy) | Same auto-recall handler, registered for backward compatibility with older OpenClaw versions |
 | `before_compaction` | Before context compaction | Logs compaction events (message count, token count, agent ID) |
-| `agent_end` | After agent completes (if `autoCapture` enabled) | Experimental: auto-captures user messages as session summaries |
 
 ## CLI Commands
 
@@ -312,7 +308,6 @@ openclaw engram import engram-backup.json
 | `maxResults` | number | `10` | Maximum search results |
 | `timeoutMs` | number | `5000` | HTTP request timeout in milliseconds |
 | `autoRecall` | boolean | `true` | Automatically inject relevant memories before each agent turn |
-| `autoCapture` | boolean | `false` | Auto-capture agent outputs as memories (experimental) |
 | `recallLimit` | number | `5` | Maximum memories injected during auto-recall |
 | `recallMinScore` | number | `0.3` | Minimum normalized BM25 relevance score for auto-recall (0.0-1.0) |
 
