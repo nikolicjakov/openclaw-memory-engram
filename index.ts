@@ -42,6 +42,14 @@ const SYSTEM_PREFIX_PATTERNS = [
   /^\[.*?\]\s*/,
 ];
 
+const SKIP_PROMPT_PATTERNS = [
+  /^continue\s+(where\s+you\s+)?left\s+off/i,
+  /previous\s+model\s+attempt\s+(failed|timed)/i,
+  /^agent-to-agent\b/i,
+  /^\s*\[announce\]\s/i,
+  /^read\s+\S+\.md\s+(if\s+)?(it\s+)?exists/i,
+];
+
 const STOP_WORDS = new Set([
   "a", "about", "above", "after", "again", "all", "also", "am", "an", "and",
   "any", "are", "as", "at", "be", "been", "before", "being", "below", "between",
@@ -60,6 +68,10 @@ const STOP_WORDS = new Set([
   "your", "yours", "yourself", "yourselves", "give", "need", "find", "show",
   "check", "help", "use", "using", "used",
 ]);
+
+function shouldSkipPrompt(prompt: string): boolean {
+  return SKIP_PROMPT_PATTERNS.some((p) => p.test(prompt));
+}
 
 function extractUserMessage(prompt: string): string {
   let cleaned = prompt.trim();
@@ -106,8 +118,8 @@ function formatObservationCompact(obs: Observation, index: number): string {
 // ============================================================================
 
 export default {
-  id: "openclaw-memory-engram",
-  name: "OpenClaw Engram Memory",
+  id: "memory-engram",
+  name: "Engram Memory",
   description: "Persistent agent memory via Engram (github.com/Gentleman-Programming/engram) — SQLite + FTS5 full-text search with topic-based deduplication",
 
   register(api: any) {
@@ -461,10 +473,13 @@ export default {
     // Hook: auto-recall with injection protection
     // Registered on both before_prompt_build (preferred, v2026.3+) and
     // before_agent_start (legacy fallback) for maximum compatibility.
+    // A dedup guard ensures only the first hook per agent+prompt fires.
     // =========================================================================
     if (config.autoRecall) {
       const RECALL_BUDGET_CHARS = 1500;
       const injectedMemoryIds = new Map<string, Set<number>>();
+      const recentlyProcessed = new Map<string, number>();
+      const DEDUP_WINDOW_MS = 2000;
 
       const getInjectedIds = (sessionKey: string): Set<number> => {
         let ids = injectedMemoryIds.get(sessionKey);
@@ -475,11 +490,49 @@ export default {
         return ids;
       };
 
-      const autoRecallHandler = async (event: { prompt?: string; modelId?: string; provider?: string }, ctx: { agentId?: string; sessionKey?: string }) => {
+      const autoRecallHandler = async (event: { prompt?: string; modelId?: string; provider?: string }, ctx: { agentId?: string; sessionKey?: string; trigger?: string; channelId?: string }) => {
         const rawPrompt = event.prompt || "";
         const agent = ctx.agentId || "unknown";
         const sessionKey = ctx.sessionKey || agent;
+        const trigger = ctx.trigger;
+        const channelId = ctx.channelId;
+
+        // Only auto-recall for channel-originated messages (user, cron).
+        // Agent-to-agent delegations and internal triggers are skipped.
+        if (trigger && trigger !== "user" && trigger !== "cron") {
+          log.info(`memory-engram: auto-recall skipped for ${agent} (trigger="${trigger}", not channel-originated)`);
+          return;
+        }
+        if (!channelId && !trigger) {
+          // No channel and no trigger metadata = likely internal/agent-to-agent
+          log.info(`memory-engram: auto-recall skipped for ${agent} (no channel/trigger context)`);
+          return;
+        }
+
+        // Dedup guard: skip if we already processed this agent+prompt within the window
+        const dedupKey = `${agent}:${rawPrompt.slice(0, 200)}`;
+        const now = Date.now();
+        const lastProcessed = recentlyProcessed.get(dedupKey);
+        if (lastProcessed && now - lastProcessed < DEDUP_WINDOW_MS) {
+          return;
+        }
+        recentlyProcessed.set(dedupKey, now);
+
+        // Evict stale dedup entries to prevent unbounded growth
+        if (recentlyProcessed.size > 200) {
+          for (const [k, ts] of recentlyProcessed) {
+            if (now - ts > DEDUP_WINDOW_MS * 5) recentlyProcessed.delete(k);
+          }
+        }
+
         const userMessage = extractUserMessage(rawPrompt);
+
+        // Skip system/framework messages that aren't real user prompts
+        if (shouldSkipPrompt(userMessage)) {
+          log.info(`memory-engram: auto-recall skipped for ${agent} (system/framework message: "${userMessage.slice(0, 60)}")`);
+          return;
+        }
+
         const keywords = extractSearchKeywords(userMessage);
 
         if (!keywords || keywords.length < 3) {
@@ -494,7 +547,7 @@ export default {
           let results = await client.search(keywords, { limit: config.recallLimit + 5 });
           if (results.length === 0) {
             const words = keywords.split(" ");
-            for (let len = words.length - 1; len >= 1 && results.length === 0; len--) {
+            for (let len = words.length - 1; len >= 2 && results.length === 0; len--) {
               const shorter = words.slice(0, len).join(" ");
               results = await client.search(shorter, { limit: config.recallLimit + 5 });
               if (results.length > 0) {
@@ -763,11 +816,11 @@ export default {
     // Service registration (lifecycle)
     // =========================================================================
     api.registerService({
-      id: "openclaw-memory-engram",
+      id: "memory-engram",
       start: () => {
         client.checkHealth().then((h) => {
           if (h.ok) {
-            log.info(`memory-engram: connected to Engram v${h.version} at ${config.url} (autoRecall=${config.autoRecall}, autoCapture=${config.autoCapture})`);
+            log.info(`memory-engram: connected to Engram v${h.version} at ${config.url} (autoRecall=${config.autoRecall} channel-only, autoCapture=${config.autoCapture})`);
           } else {
             log.warn(`memory-engram: could not reach Engram at ${config.url} — tools will gracefully degrade`);
           }

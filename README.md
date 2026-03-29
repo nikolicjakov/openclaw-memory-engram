@@ -73,7 +73,9 @@ and Markdown files for curated long-term notes.
 ## How Auto-Recall Works
 
 When `autoRecall` is enabled (default), the plugin hooks into `before_prompt_build` and
-`before_agent_start` to intercept every incoming message before the agent processes it:
+`before_agent_start` to intercept **channel-originated messages** (trigger `user` and `cron`)
+before the agent processes them. Agent-to-agent delegations and internal triggers are skipped —
+only real user messages and scheduled cron jobs trigger recall:
 
 ```
 User message → Strip channel metadata → Extract keywords → Search Engram
@@ -321,9 +323,12 @@ openclaw-memory-engram/
 ├── index.ts                  # Plugin entry point — tools, hooks, CLI registration
 ├── src/
 │   └── engram-client.ts      # HTTP client for Engram API + config parsing
+├── assets/
+│   └── banner.png            # README banner image
 ├── openclaw.plugin.json      # OpenClaw plugin manifest
 ├── package.json
 ├── tsconfig.json
+├── LICENSE
 └── README.md
 ```
 
