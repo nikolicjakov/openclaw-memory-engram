@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { EngramClient, parseConfig } from "./src/engram-client.js";
 import type { EngramConfig, Observation } from "./src/engram-client.js";
+import natural from "natural";
 
 const VALID_TYPES = [
   "decision", "bugfix", "discovery", "config", "pattern",
@@ -33,7 +34,7 @@ function looksLikeInjection(text: string): boolean {
 }
 
 // ============================================================================
-// Prompt cleaning — strip system framing and stop words for FTS5 search
+// Prompt cleaning — strip system framing for FTS5 search
 // ============================================================================
 
 const SYSTEM_PREFIX_PATTERNS = [
@@ -69,27 +70,97 @@ const STOP_WORDS = new Set([
   "check", "help", "use", "using", "used",
 ]);
 
+// ============================================================================
+// NLP-powered keyword extraction using `natural`
+// TF-IDF weights keywords by distinctiveness; stemming normalizes word forms.
+// Proper nouns and capitalized terms get a boost since they tend to be the
+// subject of the query (e.g. "Keycloak", "MikroTik", "Kubernetes").
+// ============================================================================
+
+const tokenizer = new natural.WordTokenizer();
+
+const COMMON_TECH_WORDS = new Set([
+  "server", "service", "config", "configuration", "deploy", "deployment",
+  "status", "report", "create", "update", "delete", "list", "start", "stop",
+  "run", "running", "error", "log", "logs", "file", "files", "set", "setting",
+  "variable", "variables", "environment", "instance", "cluster", "node",
+  "container", "pod", "port", "network", "database", "api", "url", "version",
+]);
+
 function shouldSkipPrompt(prompt: string): boolean {
   return SKIP_PROMPT_PATTERNS.some((p) => p.test(prompt));
 }
 
 function extractUserMessage(prompt: string): string {
   let cleaned = prompt.trim();
+  // 1. Strip previously injected engram-memory blocks (can appear at start)
+  cleaned = cleaned.replace(/<engram-memory>[\s\S]*?<\/engram-memory>/g, "");
+  // 2. Strip conversation metadata JSON blocks injected by channels
+  cleaned = cleaned.replace(/Conversation info \(untrusted metadata\):[\s\S]*$/gs, "");
+  // 3. Strip "Current time:" lines appended by OpenClaw
+  cleaned = cleaned.replace(/Current time:.*$/gm, "");
+  // 4. Trim, then strip system/channel prefix from the start
+  cleaned = cleaned.trim();
   for (const pattern of SYSTEM_PREFIX_PATTERNS) {
     cleaned = cleaned.replace(pattern, "");
   }
-  return cleaned.trim();
+  // 5. The user message is often duplicated after metadata; take the last
+  // non-empty line group as the actual message if the prompt contains
+  // the raw user text after the system framing.
+  const lines = cleaned.trim().split("\n");
+  const lastBlock: string[] = [];
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line) lastBlock.unshift(line);
+    else if (lastBlock.length > 0) break;
+  }
+  return lastBlock.join("\n").trim();
 }
 
 function extractSearchKeywords(text: string): string {
-  const words = text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s_-]/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 2 && !STOP_WORDS.has(w));
+  const tokens = tokenizer.tokenize(text.toLowerCase()) || [];
+  const meaningful = tokens.filter((w) => w.length >= 2 && !STOP_WORDS.has(w));
+  if (meaningful.length === 0) return "";
 
-  const unique = [...new Set(words)];
-  return unique.slice(0, 8).join(" ");
+  // Detect proper nouns / capitalized words from the original text
+  const properNouns = new Set<string>();
+  const origTokens = tokenizer.tokenize(text) || [];
+  for (const t of origTokens) {
+    if (t.length >= 2 && /^[A-Z]/.test(t) && !STOP_WORDS.has(t.toLowerCase())) {
+      properNouns.add(t.toLowerCase());
+    }
+  }
+
+  // Build a TF-IDF document from the query to score each term
+  const localTfidf = new natural.TfIdf();
+  localTfidf.addDocument(meaningful.join(" "));
+
+  const scored: Array<{ word: string; score: number }> = [];
+  const seen = new Set<string>();
+
+  for (const word of meaningful) {
+    if (seen.has(word)) continue;
+    seen.add(word);
+
+    let score = 0;
+    localTfidf.listTerms(0).forEach((item) => {
+      if (item.term === word) score = item.tfidf;
+    });
+
+    // Boost proper nouns (likely the subject: Keycloak, Kubernetes, etc.)
+    if (properNouns.has(word)) score *= 3.0;
+
+    // Penalize overly common tech words that match many memories
+    if (COMMON_TECH_WORDS.has(word)) score *= 0.3;
+
+    // Boost words that appear less common (longer words tend to be more specific)
+    if (word.length >= 6) score *= 1.5;
+
+    scored.push({ word, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 8).map((s) => s.word).join(" ");
 }
 
 // ============================================================================
@@ -495,17 +566,13 @@ export default {
         const agent = ctx.agentId || "unknown";
         const sessionKey = ctx.sessionKey || agent;
         const trigger = ctx.trigger;
-        const channelId = ctx.channelId;
 
-        // Only auto-recall for channel-originated messages (user, cron).
-        // Agent-to-agent delegations and internal triggers are skipped.
+        // Default-ALLOW approach: auto-recall runs unless we can positively
+        // identify the prompt as agent-to-agent or system-internal.
+        // This ensures every user message (Mattermost, Telegram, CLI, etc.)
+        // always gets memory lookup regardless of missing context fields.
         if (trigger && trigger !== "user" && trigger !== "cron") {
-          log.info(`memory-engram: auto-recall skipped for ${agent} (trigger="${trigger}", not channel-originated)`);
-          return;
-        }
-        if (!channelId && !trigger) {
-          // No channel and no trigger metadata = likely internal/agent-to-agent
-          log.info(`memory-engram: auto-recall skipped for ${agent} (no channel/trigger context)`);
+          log.info(`memory-engram: auto-recall skipped for ${agent} (trigger="${trigger}")`);
           return;
         }
 
@@ -526,6 +593,7 @@ export default {
         }
 
         const userMessage = extractUserMessage(rawPrompt);
+        log.info(`memory-engram: auto-recall for ${agent}: extracted="${userMessage.slice(0, 120)}"`);
 
         // Skip system/framework messages that aren't real user prompts
         if (shouldSkipPrompt(userMessage)) {
@@ -543,15 +611,28 @@ export default {
         try {
           log.info(`memory-engram: auto-recall for ${agent}: keywords="${keywords}"`);
 
-          // FTS5 uses AND logic, so progressively drop keywords until we get results
+          // FTS5 uses AND logic, so progressively drop keywords until we get results.
+          // Drop from the beginning first (preserves the subject at the end of the query),
+          // then from the end as a second pass.
           let results = await client.search(keywords, { limit: config.recallLimit + 5 });
           if (results.length === 0) {
             const words = keywords.split(" ");
-            for (let len = words.length - 1; len >= 2 && results.length === 0; len--) {
-              const shorter = words.slice(0, len).join(" ");
+            // Pass 1: drop generic leading words, keep subject-specific trailing words
+            for (let start = 1; start <= words.length - 2 && results.length === 0; start++) {
+              const shorter = words.slice(start).join(" ");
               results = await client.search(shorter, { limit: config.recallLimit + 5 });
               if (results.length > 0) {
                 log.info(`memory-engram: auto-recall fallback hit on "${shorter}" (${results.length} results)`);
+              }
+            }
+            // Pass 2: drop trailing words from the original query
+            if (results.length === 0) {
+              for (let len = words.length - 1; len >= 2 && results.length === 0; len--) {
+                const shorter = words.slice(0, len).join(" ");
+                results = await client.search(shorter, { limit: config.recallLimit + 5 });
+                if (results.length > 0) {
+                  log.info(`memory-engram: auto-recall fallback hit on "${shorter}" (${results.length} results)`);
+                }
               }
             }
           }
@@ -820,7 +901,7 @@ export default {
       start: () => {
         client.checkHealth().then((h) => {
           if (h.ok) {
-            log.info(`memory-engram: connected to Engram v${h.version} at ${config.url} (autoRecall=${config.autoRecall} channel-only, autoCapture=${config.autoCapture})`);
+            log.info(`memory-engram: connected to Engram v${h.version} at ${config.url} (autoRecall=${config.autoRecall} default-allow, autoCapture=${config.autoCapture})`);
           } else {
             log.warn(`memory-engram: could not reach Engram at ${config.url} — tools will gracefully degrade`);
           }
