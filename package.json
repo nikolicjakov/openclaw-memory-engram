@@ -1,6 +1,6 @@
 {
   "name": "openclaw-memory-engram",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "description": "OpenClaw memory plugin for Engram (github.com/Gentleman-Programming/engram) — SQLite + FTS5 persistent memory for AI agents",
   "main": "index.ts",
@@ -18,10 +18,16 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",
-    "natural": "^8.1.1"
+    "wink-nlp": "^2.4.0",
+    "wink-eng-lite-web-model": "^1.8.1"
   },
   "peerDependencies": {
     "openclaw": ">=2026.3.13"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
   },
   "keywords": [
     "openclaw",
@@ -37,7 +43,6 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^25.5.0",
-    "@types/natural": "^5.1.5",
     "typescript": "^5.9.3"
   }
 }

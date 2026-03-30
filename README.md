@@ -55,10 +55,10 @@ and Markdown files for curated long-term notes.
 
 - **9 agent tools** (`engram_*` namespace) — full memory lifecycle from search to session management
 - **Automatic memory recall (RAG)** — searches Engram on every incoming message and injects relevant memories into agent context before the LLM sees the prompt
-- **Smart query extraction** — strips channel metadata (Mattermost/Telegram/Discord framing, timestamps) and stop words from prompts to produce clean FTS5 search keywords
-- **Progressive FTS5 fallback** — when the full keyword query returns no results, progressively drops terms until a match is found
+- **NLP-powered keyword extraction** — uses POS tagging and named entity recognition (wink-nlp) to extract noun phrases, named entities, and technical terms (IPs, paths, acronyms, ports) from prompts; channel metadata and stop words are stripped first; raw stop-word filtering is a fallback when POS yields fewer than 2 terms
+- **Progressive FTS5 fallback** — when the full keyword query returns no results, two passes progressively drop terms: first dropping generic leading words (preserving subject-specific trailing terms), then dropping trailing words, until a match is found
 - **Session deduplication** — memories already injected in the current session are not repeated, saving context tokens on long conversations
-- **Dynamic snippet sizing** — auto-recall distributes a fixed character budget across results (more detail for fewer results, less for many)
+- **Pointer-based recall** — auto-recall injects memory pointers (title + type + project + relevance score) rather than content blobs; agents call `engram_get` with the injected `#ID` to fetch full content on demand, keeping context injection compact (~120 chars per memory)
 - **Full-text search** via BM25 ranking with project/type/scope filters
 - **Topic-based deduplication** — same `topic_key` updates existing memory instead of creating duplicates
 - **Progressive disclosure** — search → get → timeline (token-efficient)
@@ -84,21 +84,20 @@ User message → Strip channel metadata → Extract keywords → Search Engram
                                                               ↓
                                               Deduplicate (skip already-seen)
                                                               ↓
-                                              Budget snippet size per result
+                                              Build memory pointers (title + type + score)
                                                               ↓
-                                              Inject as prependContext with IDs
+                                              Inject as prependContext with #IDs
                                                               ↓
                                               Agent sees memories + prompt
 ```
 
 1. **Channel metadata stripping** — removes system framing like `System: [2026-03-28 16:39 UTC] Mattermost DM from @user:` that would pollute FTS5 search
-2. **Stop word removal** — filters out common words ("what", "how", "please", "my", etc.) that have no value in a full-text search
-3. **Progressive fallback** — FTS5 uses AND logic by default, so `kubernetes cluster configuration` fails if "configuration" isn't indexed. The plugin progressively drops trailing keywords (`kubernetes cluster` → `kubernetes`) until results appear
+2. **NLP keyword extraction** — uses wink-nlp POS tagging and named entity recognition to build multi-word noun phrases (e.g. "Docker Compose") and extract technical terms (IPs, file paths, acronyms, ports); stop-word filtering is a fallback when POS yields fewer than 2 terms
+3. **Progressive fallback** — FTS5 uses AND logic by default, so `kubernetes cluster configuration` fails if "configuration" isn't indexed. The plugin runs two passes: first dropping generic leading words to preserve subject-specific trailing terms (`cluster configuration` → `configuration`), then dropping trailing words (`kubernetes cluster` → `kubernetes`), until results appear
 4. **Relevance filtering** — results are BM25-scored and filtered by `recallMinScore` threshold
 5. **Session deduplication** — memories already injected earlier in the same session are skipped, avoiding repeated context on long conversations
-6. **Dynamic snippet sizing** — a total character budget (1500 chars) is divided across results: 1 result gets the full budget, 5 results get 300 chars each
-7. **Observation IDs included** — each injected snippet includes `[#ID]` so agents can call `engram_get` for full content
-8. **Injection protection** — each memory is checked against prompt injection patterns and HTML-escaped before being added to context
+6. **Pointer-based injection** — only the title, type, project, and relevance score are injected per memory (~120 chars each); a 1500-char budget guards against oversized blocks; agents call `engram_get` with the `#ID` to retrieve full content on demand
+7. **Injection protection** — each memory title is checked against prompt injection patterns and HTML-escaped before being added to context
 
 ## Prerequisites
 
@@ -272,7 +271,7 @@ All tools use the `engram_*` namespace to avoid conflicts with core tools.
 
 Tools accept a `type` parameter with these values:
 
-`decision` `bugfix` `discovery` `config` `pattern` `preference` `warning` `procedure` `general`
+`decision` `bugfix` `discovery` `config` `pattern` `preference` `warning` `procedure` `general` `architecture` `reference` `troubleshooting`
 
 ## Hooks
 
