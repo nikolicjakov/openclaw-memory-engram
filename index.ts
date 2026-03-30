@@ -13,6 +13,12 @@ const VALID_TYPES = [
   "architecture", "reference", "troubleshooting",
 ];
 
+interface SearchKeyword {
+  term: string;
+  score: number;
+  isPhrase: boolean;
+}
+
 // ============================================================================
 // Prompt injection protection (mirrors memory-lancedb approach)
 // ============================================================================
@@ -65,8 +71,7 @@ const SKIP_PROMPT_PATTERNS = [
 // Falls back to raw stop-word-filtered tokens when POS yields <2 terms.
 // ============================================================================
 
-function extractSearchKeywords(text: string): string {
-  // Clean the text: remove URLs, email addresses, and special chars
+function extractSearchKeywords(text: string): SearchKeyword[] {
   const cleanedText = text
     .replace(/https?:\/\/\S+/g, "")
     .replace(/\S+@\S+\.\S+/g, "")
@@ -74,7 +79,7 @@ function extractSearchKeywords(text: string): string {
     .replace(/\s+/g, " ")
     .trim();
 
-  if (!cleanedText) return "";
+  if (!cleanedText) return [];
 
   // --- Tech pattern fallback (regex-based, runs on original text) ---
   const techPatterns: string[] = [];
@@ -103,36 +108,35 @@ function extractSearchKeywords(text: string): string {
     phraseScores.set(key, Math.max(phraseScores.get(key) ?? 0, score));
   };
 
-  // Named entities (organizations, locations, etc.) — highest score
+  // Named entities — highest score
   try {
-    const entities = doc.entities().out(its.detail as any) as Array<{ value: string; type: string }>;
-    for (const ent of entities) {
-      if (ent.value && ent.value.length >= 2) {
-        addPhrase(ent.value, 3.0);
-      }
-    }
+    doc.entities().each((e: any) => {
+      const val: string = e.out(its.value);
+      if (val && val.length >= 2) addPhrase(val, 3.0);
+    });
   } catch {
-    // its.detail may not be available in all model versions — skip gracefully
+    // gracefully skip if entity API differs across model versions
   }
 
-  // POS-tagged tokens — build multi-word noun phrases
-  const tokens = doc.tokens().out(its.value as any, its.pos as any) as Array<[string, string]>;
+  // POS-tagged tokens — build multi-word noun phrases from consecutive NOUN/PROPN
+  const tokenPairs: Array<{ value: string; pos: string }> = [];
+  doc.tokens().each((t: any) => {
+    tokenPairs.push({ value: t.out(its.value), pos: t.out(its.pos) });
+  });
 
   let currentPhrase: string[] = [];
   const flushPhrase = () => {
     if (currentPhrase.length === 0) return;
     const phrase = currentPhrase.join(" ");
-    // Multi-word phrases score higher than single nouns
     const score = currentPhrase.length >= 2 ? 2.5 : 1.5;
     addPhrase(phrase, score);
-    // Also add individual tokens from longer phrases
     if (currentPhrase.length >= 2) {
       for (const tok of currentPhrase) addPhrase(tok, 1.0);
     }
     currentPhrase = [];
   };
 
-  for (const [value, pos] of tokens) {
+  for (const { value, pos } of tokenPairs) {
     if (pos === "NOUN" || pos === "PROPN") {
       currentPhrase.push(value);
     } else {
@@ -146,22 +150,142 @@ function extractSearchKeywords(text: string): string {
     addPhrase(t, 1.2);
   }
 
-  // Sort by score descending
   const ranked = Array.from(phraseScores.entries())
     .sort((a, b) => b[1] - a[1]);
 
-  const topTerms = ranked.slice(0, 10).map(([phrase]) => phrase);
-
-  // Fallback: if POS extraction yielded <2 terms, use wink-nlp's stop-word filter
-  if (topTerms.length < 2) {
-    const rawTokens = doc.tokens()
-      .filter((t: any) => !t.out(its.stopWordFlag) && t.out(its.value as any).length >= 2)
-      .out(its.value as any) as string[];
-    const fallbackTerms = [...new Set(rawTokens.map((t) => t.toLowerCase()))].slice(0, 8);
-    return fallbackTerms.join(" ");
+  if (ranked.length < 2) {
+    const fallback: string[] = [];
+    doc.tokens().each((t: any) => {
+      if (!t.out(its.stopWordFlag) && t.out(its.value).length >= 2) {
+        fallback.push(t.out(its.value).toLowerCase());
+      }
+    });
+    const fallbackTerms = [...new Set(fallback)].slice(0, 8);
+    return fallbackTerms.map((t) => ({ term: t, score: 1.0, isPhrase: false }));
   }
 
-  return topTerms.join(" ");
+  return ranked.slice(0, 8).map(([phrase, score]) => ({
+    term: phrase,
+    score,
+    isPhrase: phrase.includes(" "),
+  }));
+}
+
+// ============================================================================
+// Fan-out search: parallel per-keyword queries with composite re-ranking
+//
+// Engram's FTS5 uses implicit AND — "mattermost proxy" requires BOTH words
+// in a single memory. Fan-out runs individual searches per keyword in parallel,
+// merges results, and applies composite scoring (BM25 + recency + hit breadth
+// + title match + project affinity). This converts AND into effective OR while
+// ranking multi-keyword matches highest.
+// ============================================================================
+
+function computeRecencyScore(updatedAt: string, now: number): number {
+  try {
+    const ts = updatedAt.endsWith("Z") ? updatedAt : updatedAt + "Z";
+    const daysSince = Math.max(0, (now - new Date(ts).getTime()) / 86_400_000);
+    return Math.exp(-daysSince / 30);
+  } catch {
+    return 0.5;
+  }
+}
+
+function computeTitleMatchScore(title: string, keywords: SearchKeyword[]): number {
+  if (!title || keywords.length === 0) return 0;
+  const lower = title.toLowerCase();
+  let hits = 0;
+  for (const kw of keywords) {
+    if (lower.includes(kw.term.toLowerCase())) hits++;
+  }
+  return hits / keywords.length;
+}
+
+interface FanOutOptions {
+  limit: number;
+  project?: string;
+  type?: string;
+  scope?: string;
+  agentProject?: string;
+}
+
+async function fanOutSearch(
+  client: EngramClient,
+  keywords: SearchKeyword[],
+  opts: FanOutOptions,
+  log: { info: (...a: any[]) => void; warn: (...a: any[]) => void },
+): Promise<Array<Observation & { score: number }>> {
+  const MAX_FAN_OUT = 5;
+  const top = keywords.slice(0, MAX_FAN_OUT);
+  if (top.length === 0) return [];
+
+  const perQueryLimit = Math.min((opts.limit || 10) + 5, 25);
+  const searchOpts = { type: opts.type, scope: opts.scope, project: opts.project };
+
+  const promises = top.map((kw) =>
+    client
+      .search(kw.term, { ...searchOpts, limit: perQueryLimit })
+      .then((results) => ({ term: kw.term, results }))
+      .catch(() => ({ term: kw.term, results: [] as Observation[] })),
+  );
+
+  const batches = await Promise.all(promises);
+  const activeQueries = batches.filter((b) => b.results.length > 0).length;
+  if (activeQueries === 0) return [];
+
+  const merged = new Map<
+    number,
+    { observation: Observation; bestAbsRank: number; hitCount: number; matchedTerms: Set<string> }
+  >();
+
+  for (const { term, results } of batches) {
+    for (const obs of results) {
+      const absRank = Math.abs(obs.rank ?? 0);
+      const existing = merged.get(obs.id);
+      if (existing) {
+        existing.hitCount++;
+        existing.matchedTerms.add(term);
+        if (absRank > existing.bestAbsRank) existing.bestAbsRank = absRank;
+      } else {
+        merged.set(obs.id, {
+          observation: obs,
+          bestAbsRank: absRank,
+          hitCount: 1,
+          matchedTerms: new Set([term]),
+        });
+      }
+    }
+  }
+
+  if (merged.size === 0) return [];
+
+  const now = Date.now();
+  const maxAbsRank = Math.max(...Array.from(merged.values()).map((m) => m.bestAbsRank), 0.001);
+
+  const scored = Array.from(merged.values()).map((m) => {
+    const bm25 = m.bestAbsRank / maxAbsRank;
+    const hitRatio = m.hitCount / activeQueries;
+    const recency = computeRecencyScore(m.observation.updated_at, now);
+    const titleMatch = computeTitleMatchScore(m.observation.title, top);
+    const projectBoost =
+      opts.agentProject && m.observation.project === opts.agentProject ? 1.15 : 1.0;
+
+    const composite =
+      (0.35 * bm25 + 0.30 * hitRatio + 0.20 * recency + 0.15 * titleMatch) * projectBoost;
+
+    return { ...m.observation, score: composite };
+  });
+
+  const maxScore = Math.max(...scored.map((s) => s.score), 0.001);
+  for (const s of scored) s.score = s.score / maxScore;
+
+  scored.sort((a, b) => b.score - a.score);
+
+  log.info(
+    `memory-engram: fan-out: [${top.map((k) => k.term).join(", ")}] → ${merged.size} unique from ${activeQueries}/${top.length} queries`,
+  );
+
+  return scored.slice(0, opts.limit || 10);
 }
 
 function shouldSkipPrompt(prompt: string): boolean {
@@ -251,24 +375,43 @@ export default {
           limit: Type.Optional(Type.Number({ description: "Max results (default 10)", minimum: 1, maximum: 50 })),
         }),
         async execute(_id: string, params: { query: string; project?: string; type?: string; scope?: string; limit?: number }) {
-          const results = await client.search(params.query, {
+          const limit = params.limit ?? 10;
+
+          // Try exact FTS5 query first (preserves precise AND matching)
+          const exactResults = await client.search(params.query, {
             project: params.project,
             type: params.type,
             scope: params.scope,
-            limit: params.limit,
+            limit,
           });
 
-          if (results.length === 0) {
+          if (exactResults.length > 0) {
+            const scored = client.normalizeScores(exactResults);
+            const formatted = scored.map((obs, i) => formatObservation(obs, i)).join("\n\n");
             return {
-              content: [{ type: "text" as const, text: `No Engram memories found for: "${params.query}"${params.project ? `. Try searching without project filter.` : ""}` }],
+              content: [{ type: "text" as const, text: `Found ${scored.length} memories:\n\n${formatted}` }],
             };
           }
 
-          const scored = client.normalizeScores(results);
-          const formatted = scored.map((obs, i) => formatObservation(obs, i)).join("\n\n");
+          // Exact query returned nothing — fan-out: search each keyword individually and merge
+          const keywords = extractSearchKeywords(params.query);
+          if (keywords.length > 0) {
+            const fanResults = await fanOutSearch(
+              client,
+              keywords,
+              { limit, project: params.project, type: params.type, scope: params.scope },
+              log,
+            );
+            if (fanResults.length > 0) {
+              const formatted = fanResults.map((obs, i) => formatObservation(obs, i)).join("\n\n");
+              return {
+                content: [{ type: "text" as const, text: `Found ${fanResults.length} memories (broadened search — exact query "${params.query}" had no results):\n\n${formatted}` }],
+              };
+            }
+          }
 
           return {
-            content: [{ type: "text" as const, text: `Found ${scored.length} memories:\n\n${formatted}` }],
+            content: [{ type: "text" as const, text: `No Engram memories found for: "${params.query}"${params.project ? `. Try searching without project filter.` : ""}` }],
           };
         },
       },
@@ -576,45 +719,26 @@ export default {
 
         const keywords = extractSearchKeywords(userMessage);
 
-        if (!keywords || keywords.length < 3) {
+        if (keywords.length === 0) {
           log.info(`memory-engram: auto-recall skipped for ${agent} (no meaningful keywords from: "${userMessage.slice(0, 40)}")`);
           return;
         }
 
         try {
-          log.info(`memory-engram: auto-recall for ${agent}: keywords="${keywords}"`);
+          log.info(`memory-engram: auto-recall for ${agent}: keywords=[${keywords.map((k) => `${k.term}(${k.score.toFixed(1)})`).join(", ")}]`);
 
-          // FTS5 uses AND logic, so progressively drop keywords until we get results.
-          // Drop from the beginning first (preserves the subject at the end of the query),
-          // then from the end as a second pass.
-          let results = await client.search(keywords, { limit: config.recallLimit + 5 });
-          if (results.length === 0) {
-            const words = keywords.split(" ");
-            // Pass 1: drop generic leading words, keep subject-specific trailing words
-            for (let start = 1; start <= words.length - 2 && results.length === 0; start++) {
-              const shorter = words.slice(start).join(" ");
-              results = await client.search(shorter, { limit: config.recallLimit + 5 });
-              if (results.length > 0) {
-                log.info(`memory-engram: auto-recall fallback hit on "${shorter}" (${results.length} results)`);
-              }
-            }
-            // Pass 2: drop trailing words from the original query
-            if (results.length === 0) {
-              for (let len = words.length - 1; len >= 2 && results.length === 0; len--) {
-                const shorter = words.slice(0, len).join(" ");
-                results = await client.search(shorter, { limit: config.recallLimit + 5 });
-                if (results.length > 0) {
-                  log.info(`memory-engram: auto-recall fallback hit on "${shorter}" (${results.length} results)`);
-                }
-              }
-            }
-          }
-          if (results.length === 0) {
-            log.info(`memory-engram: auto-recall for ${agent}: no results`);
+          const scored = await fanOutSearch(
+            client,
+            keywords,
+            { limit: config.recallLimit + 5, agentProject: config.project },
+            log,
+          );
+
+          if (scored.length === 0) {
+            log.info(`memory-engram: auto-recall for ${agent}: no results from fan-out`);
             return;
           }
 
-          const scored = client.normalizeScores(results);
           const alreadySeen = getInjectedIds(sessionKey);
           const relevant = scored
             .filter((o) => o.score >= config.recallMinScore)
@@ -622,7 +746,7 @@ export default {
             .slice(0, config.recallLimit);
 
           if (relevant.length === 0) {
-            log.info(`memory-engram: auto-recall for ${agent}: ${results.length} results, none new above score threshold ${config.recallMinScore}`);
+            log.info(`memory-engram: auto-recall for ${agent}: ${scored.length} results, none new above score threshold ${config.recallMinScore}`);
             return;
           }
 
@@ -684,15 +808,28 @@ export default {
           .option("--type <type>", "Filter by observation type")
           .option("--limit <n>", "Max results", "10")
           .action(async (query: string, opts: any) => {
-            const results = await client.search(query, {
-              project: opts.project,
-              type: opts.type,
-              limit: parseInt(opts.limit),
-            });
+            const limit = parseInt(opts.limit);
+            const searchOpts = { project: opts.project, type: opts.type, limit };
+
+            let results = await client.search(query, searchOpts);
+            let broadened = false;
+
             if (results.length === 0) {
-              console.log(`No memories found for: "${query}"`);
+              const keywords = extractSearchKeywords(query);
+              if (keywords.length > 0) {
+                const fanResults = await fanOutSearch(client, keywords, { ...searchOpts, limit }, log);
+                if (fanResults.length > 0) {
+                  console.log(`\nFound ${fanResults.length} memories (broadened search — exact query had no results):\n`);
+                  fanResults.forEach((obs, i) => { console.log(formatObservation(obs, i)); console.log(); });
+                  broadened = true;
+                }
+              }
+              if (!broadened) {
+                console.log(`No memories found for: "${query}"`);
+              }
               return;
             }
+
             const scored = client.normalizeScores(results);
             console.log(`\nFound ${scored.length} memories:\n`);
             scored.forEach((obs, i) => {
