@@ -344,7 +344,7 @@ function formatObservationCompact(obs: Observation, index: number): string {
 // ============================================================================
 
 export default {
-  id: "memory-engram",
+  id: "openclaw-memory-engram",
   name: "Engram Memory",
   description: "Persistent agent memory via Engram (github.com/Gentleman-Programming/engram) — SQLite + FTS5 full-text search with topic-based deduplication",
 
@@ -657,15 +657,17 @@ export default {
     );
 
     // =========================================================================
-    // Hook: auto-recall with injection protection
-    // Registered on both before_prompt_build (preferred, v2026.3+) and
-    // before_agent_start (legacy fallback) for maximum compatibility.
-    // A dedup guard ensures only the first hook per agent+prompt fires.
+    // Hooks: conversation logging + auto-recall
+    //
+    // OpenClaw allows only ONE handler per hook name per plugin.
+    // before_prompt_build does both: log user message + inject recalled memories.
+    // llm_output logs the agent reply.
     // =========================================================================
-    if (config.autoRecall) {
+    {
       const RECALL_BUDGET_CHARS = 1500;
       const injectedMemoryIds = new Map<string, Set<number>>();
       const recentlyProcessed = new Map<string, number>();
+      const openedSessions = new Set<string>();
       const DEDUP_WINDOW_MS = 2000;
 
       const getInjectedIds = (sessionKey: string): Set<number> => {
@@ -677,23 +679,51 @@ export default {
         return ids;
       };
 
-      const autoRecallHandler = async (event: { prompt?: string; modelId?: string; provider?: string }, ctx: { agentId?: string; sessionKey?: string; trigger?: string; channelId?: string }) => {
+      const ensureSession = async (sessionId: string) => {
+        if (openedSessions.has(sessionId)) return;
+        openedSessions.add(sessionId);
+        await client.startSession(sessionId, config.project);
+      };
+
+      const promptBuildHandler = async (
+        event: { prompt?: string; messages?: unknown[]; modelId?: string; provider?: string },
+        ctx: { agentId?: string; sessionKey?: string; trigger?: string; channelId?: string },
+      ) => {
         const rawPrompt = event.prompt || "";
         const agent = ctx.agentId || "unknown";
         const sessionKey = ctx.sessionKey || agent;
         const trigger = ctx.trigger;
 
-        // Default-ALLOW approach: auto-recall runs unless we can positively
-        // identify the prompt as agent-to-agent or system-internal.
-        // This ensures every user message (Mattermost, Telegram, CLI, etc.)
-        // always gets memory lookup regardless of missing context fields.
         if (trigger && trigger !== "user" && trigger !== "cron") {
           log.info(`memory-engram: auto-recall skipped for ${agent} (trigger="${trigger}")`);
           return;
         }
 
-        // Dedup guard: skip if we already processed this agent+prompt within the window
-        const dedupKey = `${agent}:${rawPrompt.slice(0, 200)}`;
+        // Extract user message: prefer the last user-role message from event.messages,
+        // which is the actual conversation turn. event.prompt is the system prompt.
+        let userMessage = "";
+        const messages = Array.isArray(event.messages) ? event.messages : [];
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i] as Record<string, unknown>;
+          if (msg?.role === "user") {
+            const content = msg.content;
+            if (typeof content === "string") {
+              userMessage = content.trim();
+            } else if (Array.isArray(content)) {
+              userMessage = (content as Array<Record<string, unknown>>)
+                .filter((c) => c?.type === "text")
+                .map((c) => c.text as string)
+                .join("\n")
+                .trim();
+            }
+            break;
+          }
+        }
+        // Fall back to extracting from system prompt if messages yielded nothing
+        if (!userMessage) userMessage = extractUserMessage(rawPrompt);
+
+        // Dedup guard: both before_prompt_build and before_agent_start may fire
+        const dedupKey = `${agent}:${userMessage.slice(0, 200)}`;
         const now = Date.now();
         const lastProcessed = recentlyProcessed.get(dedupKey);
         if (lastProcessed && now - lastProcessed < DEDUP_WINDOW_MS) {
@@ -701,26 +731,47 @@ export default {
         }
         recentlyProcessed.set(dedupKey, now);
 
-        // Evict stale dedup entries to prevent unbounded growth
         if (recentlyProcessed.size > 200) {
           for (const [k, ts] of recentlyProcessed) {
             if (now - ts > DEDUP_WINDOW_MS * 5) recentlyProcessed.delete(k);
           }
         }
 
-        const userMessage = extractUserMessage(rawPrompt);
-        log.info(`memory-engram: auto-recall for ${agent}: extracted="${userMessage.slice(0, 120)}"`);
+        log.info(`memory-engram: prompt for ${agent}: extracted="${userMessage.slice(0, 120)}"`);
 
-        // Skip system/framework messages that aren't real user prompts
-        if (shouldSkipPrompt(userMessage)) {
-          log.info(`memory-engram: auto-recall skipped for ${agent} (system/framework message: "${userMessage.slice(0, 60)}")`);
+        if (!userMessage || shouldSkipPrompt(userMessage)) {
+          log.info(`memory-engram: skipped for ${agent} (empty or system/framework message)`);
           return;
         }
 
-        const keywords = extractSearchKeywords(userMessage);
+        // ── Conversation logging: save user message ──
+        if (trigger === "user" || !trigger) {
+          try {
+            await ensureSession(sessionKey);
+            const title = userMessage.slice(0, 100).replace(/\n/g, " ");
+            const saved = await client.save({
+              session_id: sessionKey,
+              title,
+              content: userMessage,
+              type: "prompt",
+              project: config.project,
+              topic_key: `session/${sessionKey}/user`,
+              scope: "personal",
+            });
+            if (saved) {
+              log.info(`memory-engram: saved user prompt #${saved.id} for session ${sessionKey}`);
+            }
+          } catch (err) {
+            log.warn(`memory-engram: failed to save user prompt: ${String(err)}`);
+          }
+        }
 
+        if (!config.autoRecall) return;
+
+        // ── Auto-recall ──
+        const keywords = extractSearchKeywords(userMessage);
         if (keywords.length === 0) {
-          log.info(`memory-engram: auto-recall skipped for ${agent} (no meaningful keywords from: "${userMessage.slice(0, 40)}")`);
+          log.info(`memory-engram: auto-recall skipped for ${agent} (no meaningful keywords)`);
           return;
         }
 
@@ -750,9 +801,6 @@ export default {
             return;
           }
 
-          // Pointer-based recall: inject title + metadata only (no content blobs).
-          // Each pointer is ~120 chars — fits ~12 memories in the 1500-char budget.
-          // Use engram_get to fetch full content when needed.
           const safeMemories = relevant
             .filter((o) => !looksLikeInjection(o.title))
             .map((o, i) => {
@@ -763,7 +811,6 @@ export default {
 
           if (!safeMemories) return;
 
-          // Budget guard: log a warning if we somehow exceed the char limit
           if (safeMemories.length > RECALL_BUDGET_CHARS) {
             log.warn(`memory-engram: pointer block exceeded ${RECALL_BUDGET_CHARS} chars (${safeMemories.length}) — trimming`);
           }
@@ -780,8 +827,38 @@ export default {
         }
       };
 
-      api.on("before_prompt_build", autoRecallHandler);
-      api.on("before_agent_start", autoRecallHandler);
+      api.on("before_prompt_build", promptBuildHandler);
+      api.on("before_agent_start", promptBuildHandler);
+
+      // ── Agent reply logging via llm_output ──
+      api.on(
+        "llm_output",
+        async (
+          event: { sessionId: string; assistantTexts: string[] },
+          _ctx: unknown,
+        ) => {
+          const text = (event.assistantTexts ?? []).join("\n").trim();
+          if (!text) return;
+
+          const sessionId = event.sessionId ?? `conv-${Date.now()}`;
+          try {
+            await ensureSession(sessionId);
+            const title = text.slice(0, 100).replace(/\n/g, " ");
+            await client.save({
+              session_id: sessionId,
+              title,
+              content: text,
+              type: "conversation",
+              project: config.project,
+              topic_key: `session/${sessionId}/agent`,
+              scope: "personal",
+            });
+            log.info(`memory-engram: saved agent reply for session ${sessionId}`);
+          } catch (err) {
+            log.warn(`memory-engram: failed to save agent reply: ${String(err)}`);
+          }
+        },
+      );
     }
 
     // =========================================================================

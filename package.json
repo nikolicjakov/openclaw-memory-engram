@@ -41,6 +41,9 @@
   ],
   "author": "Jakov Nikolić <nikolicjakov@gmail.com>",
   "license": "MIT",
+  "scripts": {
+    "build": "tsc && cp openclaw.plugin.json dist/openclaw.plugin.json"
+  },
   "devDependencies": {
     "@types/node": "^25.5.0",
     "typescript": "^5.9.3"

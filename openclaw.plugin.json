@@ -3,6 +3,23 @@
   "name": "OpenClaw Engram Memory",
   "description": "Persistent agent memory via Engram (github.com/Gentleman-Programming/engram) — SQLite + FTS5 full-text search with session lifecycle, topic-based deduplication, auto-recall, and progressive disclosure",
   "version": "1.0.4",
+  "entry": "dist/index.js",
+  "activation": {
+    "onCapabilities": ["hook"]
+  },
+  "contracts": {
+    "tools": [
+      "engram_search",
+      "engram_get",
+      "engram_save",
+      "engram_update",
+      "engram_delete",
+      "engram_context",
+      "engram_timeline",
+      "engram_recent",
+      "engram_stats"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
